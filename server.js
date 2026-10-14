@@ -6,6 +6,7 @@ const rateLimit = require("express-rate-limit");
 const fs = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
+const { MongoClient } = require("mongodb");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -31,22 +32,53 @@ const PENSION = { 18:55,19:58,20:61,21:64,22:68,23:72,24:76,25:80,26:85,27:90,28
 const OCCUPATIONS = ["Street vendor", "Domestic worker", "Construction worker", "Gig / delivery worker", "Home-based worker", "Waste picker", "Other"];
 const INTERESTS = SCHEMES.map(s => s.id);
 
-/* ---------- Storage (JSON file) ---------- */
+/* ---------- Storage: MongoDB Atlas (JSON file fallback if MONGODB_URI is not set) ---------- */
+const MONGODB_URI = process.env.MONGODB_URI || "";
+let col = null;
+async function initDb() {
+  if (!MONGODB_URI) { console.warn("MONGODB_URI not set: using a local JSON file. Data can be lost on restart."); return; }
+  const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
+  await client.connect();
+  col = client.db(process.env.DB_NAME || "shram_saathi").collection("registrations");
+  await col.createIndex({ phone: 1 }, { unique: true });
+  await col.createIndex({ createdAt: -1 });
+  console.log("MongoDB connected");
+}
 const FILE = "registrations.json";
-async function readAll() {
+async function readFile() {
   try { return JSON.parse(await fs.readFile(path.join(DATA_DIR, FILE), "utf8")); } catch { return []; }
 }
 let queue = Promise.resolve();
-function addRecord(rec) {
+async function readAll() {
+  if (col) return col.find({}, { projection: { _id: 0 } }).sort({ createdAt: -1 }).toArray();
+  return readFile();
+}
+async function addRecord(rec) {
+  if (col) {
+    try { await col.insertOne({ ...rec }); }
+    catch (e) { if (e.code === 11000) { const d = new Error("dup"); d.code = "DUP"; throw d; } throw e; }
+    return;
+  }
   const job = queue.catch(() => {}).then(async () => {
     await fs.mkdir(DATA_DIR, { recursive: true });
-    const all = await readAll();
+    const all = await readFile();
     if (all.some(r => r.phone === rec.phone)) { const e = new Error("dup"); e.code = "DUP"; throw e; }
     all.push(rec);
     await fs.writeFile(path.join(DATA_DIR, FILE), JSON.stringify(all, null, 2));
   });
   queue = job;
   return job;
+}
+async function getStats() {
+  const byOccupation = {};
+  if (col) {
+    const registered = await col.countDocuments();
+    (await col.aggregate([{ $group: { _id: "$occupation", n: { $sum: 1 } } }]).toArray()).forEach(a => { byOccupation[a._id] = a.n; });
+    return { registered, byOccupation };
+  }
+  const all = await readFile();
+  all.forEach(r => { byOccupation[r.occupation] = (byOccupation[r.occupation] || 0) + 1; });
+  return { registered: all.length, byOccupation };
 }
 const clean = (s, max) => String(s ?? "").replace(/[<>]/g, "").trim().slice(0, max);
 
@@ -116,11 +148,8 @@ app.post("/api/register", registerLimit, async (req, res, next) => {
   }
 });
 
-app.get("/api/stats", async (req, res) => {
-  const all = await readAll();
-  const byOccupation = {};
-  all.forEach(r => { byOccupation[r.occupation] = (byOccupation[r.occupation] || 0) + 1; });
-  res.json({ registered: all.length, byOccupation });
+app.get("/api/stats", async (req, res, next) => {
+  try { res.json(await getStats()); } catch (e) { next(e); }
 });
 
 /* ---------- Admin ---------- */
@@ -130,7 +159,41 @@ function adminOnly(req, res, next) {
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
-app.get("/api/admin/registrations", adminOnly, async (req, res) => res.json({ registrations: await readAll() }));
+app.get("/api/admin/registrations", adminOnly, async (req, res, next) => {
+  try { res.json({ registrations: await readAll() }); } catch (e) { next(e); }
+});
+const csvCell = v => {
+  let s = Array.isArray(v) ? v.join(" | ") : String(v ?? "");
+  if (/^[=+\-@]/.test(s)) s = "'" + s;
+  return '"' + s.replace(/"/g, '""') + '"';
+};
+app.get("/api/admin/registrations.csv", adminOnly, async (req, res, next) => {
+  try {
+    const rows = await readAll();
+    const head = ["name", "phone", "city", "occupation", "interests", "createdAt"];
+    const lines = [head.join(",")].concat(rows.map(r => head.map(h => csvCell(r[h])).join(",")));
+    res.set("Content-Type", "text/csv; charset=utf-8");
+    res.set("Content-Disposition", "attachment; filename=registrations.csv");
+    res.send(lines.join("\n"));
+  } catch (e) { next(e); }
+});
+
+const ADMIN_HTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shram Saathi Admin</title>
+<style>body{font:16px system-ui,sans-serif;margin:0;padding:16px;max-width:1000px;margin:auto}input,button{font:inherit;padding:8px 12px;margin:4px 4px 4px 0}table{border-collapse:collapse;width:100%;margin-top:12px}th,td{border-bottom:1px solid #ccc;padding:6px;text-align:left;font-size:14px}.s{overflow-x:auto}</style></head>
+<body><h1>Registrations</h1><input id="k" type="password" placeholder="Admin key"><button id="load">Load</button><button id="csv">Download CSV</button><div id="m"></div>
+<div class="s"><table><thead><tr><th>Name</th><th>Phone</th><th>City</th><th>Occupation</th><th>Schemes</th><th>Date</th></tr></thead><tbody id="tb"></tbody></table></div>
+<script>
+const $=id=>document.getElementById(id);
+async function get(p){const r=await fetch(p,{headers:{"x-admin-key":$("k").value}});if(!r.ok)throw new Error(r.status===401?"Wrong key":"Error "+r.status);return r}
+$("load").onclick=async()=>{$("m").textContent="Loading...";try{const j=await(await get("/api/admin/registrations")).json();const tb=$("tb");tb.textContent="";
+j.registrations.forEach(r=>{const tr=document.createElement("tr");[r.name,r.phone,r.city,r.occupation,(r.interests||[]).join(", "),new Date(r.createdAt).toLocaleString()].forEach(v=>{const td=document.createElement("td");td.textContent=v;tr.appendChild(td)});tb.appendChild(tr)});
+$("m").textContent=j.registrations.length+" registrations"}catch(e){$("m").textContent=e.message}};
+$("csv").onclick=async()=>{try{const b=await(await get("/api/admin/registrations.csv")).blob();const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="registrations.csv";a.click()}catch(e){$("m").textContent=e.message}};
+</script></body></html>`;
+app.get("/admin", (req, res) => {
+  res.set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'");
+  res.type("html").send(ADMIN_HTML);
+});
 
 /* ---------- Errors ---------- */
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
@@ -140,4 +203,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Server error" });
 });
 
-app.listen(PORT, () => console.log("Shram Saathi API running on port " + PORT));
+initDb()
+  .then(() => app.listen(PORT, () => console.log("Shram Saathi API running on port " + PORT)))
+  .catch(e => { console.error("Database connection failed:", e.message); process.exit(1); });
